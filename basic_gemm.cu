@@ -99,3 +99,188 @@ cudaError_t InitializeMatrix(float *matrix, int rows, int columns, int seed = 0)
 
     return cudaGetLastError();
 }
+
+//// Allocates device memory for a maxtrix then fills with arbitray small integers.
+cudaError_t AllocateMatrix(float **matrix, int rows, int columns, int seed = 0){
+    cudaError_t result;
+    size_t sizeof_matrix = sizeof(float) * rows * columns;
+
+    // Allocate device memory.
+    result = cudaMalloc(reinterpret_cast<float *>(matrix), sizeof_matrix);
+
+    if (result != cudaSuccess) {
+    std::cerr << "Failed to allocate matrix: "
+      << cudaGetErrorString(result) << std::endl;
+    return result;
+  }
+
+  // Initialize matrix elements to arbitrary small integers.
+  result = InitializeMatrix(*matrix, rows, columns, seed);
+
+  if (result != cudaSuccess) {
+    std::cerr << "Failed to clear matrix device memory:"
+    << cudaGetErrorString(result) << std::endl;
+    return result;
+  }
+
+  // Initialize matrix elements to arbitrary small integers.
+  result = InitalizeMatrix(*matrix, rows, columns, seed);
+
+  if (result != cudaSuccess) {
+    std::cerr << "Failed to initialize matrix:"
+    << cudaGetErrorString(result) << std::endl;
+    return result;
+  }
+  return result;
+}
+
+/// Naive reference GEMM computation.
+__global__ void ReferenceGemm_kernel(
+    int M,
+    int N,
+    int K,
+    float alpha,
+    float const *A,
+    int lda,
+    float beta,
+    float *C,
+    int ldc) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    int j = threadIdx.y + blockIdx.y * blockDim.y;
+
+    if (i < M && j < N){
+        float accumulator = 0;
+
+        for (int k = 0; k < K; ++k){
+            accumulator += A[i + k * lda] * B[k + j * ldb];
+        }
+
+        C[i + j * ldc] = alpha * accumulator + beta * C[i + j * ldc];
+    }
+    }
+
+/// Reference GEMM computation.
+cudaError_t ReferenceGEMM(
+    int M,
+    int N,
+    int K,
+    float alpha, 
+    float const *A,
+    int lda,
+    float beta,
+    float *C,
+    int idc {
+        dim3 block(16, 16);
+        dim3 grid(
+            (M + block.x - 1) / block.x,
+            (N + block.y - 1) / block.y
+        );
+
+        ReferenceGEMM_kernel<<<grid, block >>> (M, N, K, alpha, A, lda, B, ldb, beta, C, idc);
+
+        return cudaGetLastError();
+    }
+)
+
+/// Allocate several matrices in GPU device memory and call single-precision
+/// CUTLASS GEMM kernel.
+cudaError_t TestCultlassGemm(int M, int N, int K, float alpha, float beta) {
+    cudaError_t result;
+
+    // 
+    // Define several matrices to be used as operands to GEMM kernels.
+
+    // Compute leading dimension for each matrix.
+    int lda = M;
+    int ldb = K;
+    int ldc = M;
+
+    // Compute size in bytes of the C matrix.
+    size_t sizeof_C = sizeof(float) * ldc * N;
+
+    // Define pointers to matrices in GPU device memory.
+    float *A,
+    float *B;
+    float *C_cutlass;
+    float *C_reference;
+
+    // Allocate metrices in GPU device memory with arbitrary seeds.
+
+    result = AllocateMatrix(&A, M, K, 0);
+
+    if (result != cudaSuccess) {
+        return result;
+    }
+
+    result = AllocateMatrix(&B, K, N, 17);
+
+    if(result != cudaSuccess) {
+        cudaFree(A);
+        return result;
+    }
+
+    result = AllocateMatrix(&C_cutlass, M, N, 101);
+
+    if (result != cudaSuccess) {
+        cudaFree(A);
+        cudaFree(B);
+        return result;
+    }
+
+    result = AllocateMatrix(&C_reference, M, N, 101);
+
+    if (result != cudaSuccess) {
+        cudaFree(A);
+        cudaFree(B);
+        cudaFree(C_cutlass);
+        return result;
+    }
+
+    result = cudaMemcpy(C_reference, C_cutlass, sizeof_C, cudaMemcpyDeviceToDevice);
+
+    if (result != cudaSuccess) {
+        std::cerr << "Failed to copy C_cutlass matrix to C_reference:"
+        << cudaGetErrorString(result) << std::endl;
+
+        cudaFree(C_reference);
+        cudaFree(C_cutlass);
+        cudaFree(B);
+        cudaFree(A);
+
+        return result;
+    }
+
+    // Copy to host and verify equivalence.
+    std::vector<float> host_cutlass(ldc * N, 0);
+    std::vector<float> host_cutlass(ldc * N, 0);
+    
+    result = cudaMemcpy(host_cutlass.data(), C_cutlass, sizeof_C, cudaMemcpyDeviceToHost);
+
+    if (result != cudaSuccess) {
+        std::cerr << "Failed to copy CUTLASS GEMM result:"
+        << cudaGetErrorString(result) << std::endl;
+
+        cudaFree(C_reference);
+        cudaFree(C_cutlass);
+        cudaFree(B);
+        cudaFree(A);
+
+        return result;
+    }
+
+    result = cudaMemcpy(host_reference.data(), C_reference, sizeof_C, cudaMemcpyDeviceToHost);
+
+    if (result != cudaSuccess) {
+        std::cerr << "Failed to copy CUTLASS GEMM result:"
+        << cudaGetErrorString(result) << std::endl;
+
+        cudaFree(C_reference);
+        cudaFree(C_cutlass);
+        cudaFree(B);
+        cudaFree(A);
+
+        return result;
+    }
+
+    // 411 
+}
