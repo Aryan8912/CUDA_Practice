@@ -1,0 +1,4 @@
+torch>=2.0.0
+triton>=2.0.0
+transformers>=4.30.0
+bitsandbytes>=0.41.0
