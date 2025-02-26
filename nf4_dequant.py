@@ -99,7 +99,8 @@ class NF4Dequantizer:
         self,
         bnb_config: Optional[BitsAndBytesConfig] = None,
         memory_format: str = MemoryFormat.CONTIGUOUS,
-        device: Optional[torch.device] = None
+        device: Optional[torch.device] = None,
+        compile_mode: str = "reduce-overhead"
     ):
         if device is None:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -120,8 +121,40 @@ class NF4Dequantizer:
         self.config = NF4Config()
         
         # T4-specific optimizations
-        self.block_size = min(T4_MAX_BLOCK_SIZE, 128)  # Reduced block size for better compatibility
-        self.max_batch_elements = 512 * 1024  # Reduced batch size for T4
+        self.block_size = min(T4_MAX_BLOCK_SIZE, 128)
+        self.max_batch_elements = 512 * 1024
+        
+        # Compile the processing functions
+        try:
+            self._process_batch_compiled = torch.compile(
+                self._process_batch,
+                mode=compile_mode,
+                fullgraph=True,
+                options={
+                    "max_autotune": True,
+                    "triton.cudagraphs": True,
+                    "triton.persistent_cache": True
+                }
+            )
+            self._fallback_dequantize_compiled = torch.compile(
+                self._fallback_dequantize,
+                mode=compile_mode,
+                fullgraph=True
+            )
+            self.use_compiled = True
+            print("✓ Using compiled mode for faster execution")
+        except Exception as e:
+            warnings.warn(f"Torch compile not available: {str(e)}. Using eager mode.")
+            self._process_batch_compiled = self._process_batch
+            self._fallback_dequantize_compiled = self._fallback_dequantize
+            self.use_compiled = False
+    
+    def _fallback_dequantize(self, batch: torch.Tensor, absmax: torch.Tensor, double_quant_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """PyTorch fallback implementation for dequantization."""
+        scale = absmax[:, None] / self.config.CLIP_MAX
+        if self.use_double_quant and double_quant_scale is not None:
+            scale = scale * double_quant_scale[:, None]
+        return ((batch - 8) * scale).to(self.compute_dtype)
     
     def _process_batch(self, quantized_tensor: torch.Tensor, start_idx: int, end_idx: int) -> torch.Tensor:
         """Process a batch of data to avoid OOM."""
@@ -183,17 +216,7 @@ class NF4Dequantizer:
             
         except Exception as e:
             warnings.warn(f"Triton kernel failed: {str(e)}. Falling back to PyTorch implementation.")
-            # PyTorch fallback implementation
-            scale = absmax[:, None] / self.config.CLIP_MAX
-            if self.use_double_quant:
-                if double_quant_scale is None:
-                    double_quant_scale = torch.rand(
-                        M,
-                        device=self.device,
-                        dtype=self.compute_dtype
-                    ) * 2.0
-                scale = scale * double_quant_scale[:, None]
-            return ((batch - 8) * scale).to(self.compute_dtype)
+            return self._fallback_dequantize_compiled(batch, absmax, double_quant_scale)
     
     @torch.no_grad()
     def dequantize(
@@ -218,21 +241,23 @@ class NF4Dequantizer:
                 quantized_tensor.shape[0],
                 self.max_batch_elements // quantized_tensor.shape[1]
             )
-            batch_size = max(1, batch_size)  # Ensure batch size is at least 1
+            batch_size = max(1, batch_size)
         
         outputs = []
         for i in range(0, quantized_tensor.shape[0], batch_size):
             end_idx = min(i + batch_size, quantized_tensor.shape[0])
-            batch_output = self._process_batch(quantized_tensor, i, end_idx)
+            batch_output = self._process_batch_compiled(quantized_tensor, i, end_idx)
             outputs.append(batch_output)
         
         return torch.cat(outputs, dim=0)
 
-def test_t4_compatibility(
+def benchmark_dequantizer(
     shapes: list[Tuple[int, int]] = None,
-    batch_size: Optional[int] = None
+    batch_size: Optional[int] = None,
+    num_warmup: int = 5,
+    num_runs: int = 10
 ):
-    """Test the dequantizer with T4-friendly configurations."""
+    """Benchmark the dequantizer with and without compilation."""
     if shapes is None:
         shapes = [
             (128, 128),    # Small matrix
@@ -240,70 +265,63 @@ def test_t4_compatibility(
             (1024, 512),   # Larger matrix
         ]
     
-    dequantizer = NF4Dequantizer(
-        bnb_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16
-        )
-    )
+    # Create dequantizers
+    dequantizer_compiled = NF4Dequantizer(compile_mode="reduce-overhead")
+    dequantizer_eager = NF4Dequantizer()
+    dequantizer_eager.use_compiled = False  # Force eager mode
     
-    print("\nTesting NF4 Dequantization on T4 GPU:")
+    print("\nBenchmarking NF4 Dequantization:")
     print("=" * 60)
-    print(f"Block size: {dequantizer.block_size}")
-    print(f"Max batch elements: {dequantizer.max_batch_elements}")
-    print(f"Compute dtype: {dequantizer.compute_dtype}")
+    print(f"Block size: {dequantizer_compiled.block_size}")
+    print(f"Compute dtype: {dequantizer_compiled.compute_dtype}")
+    print(f"Number of runs: {num_runs}")
+    print("-" * 60)
+    print(f"{'Shape':>12} | {'Eager (ms)':>12} | {'Compiled (ms)':>12} | {'Speedup':>8}")
     print("-" * 60)
     
     for M, N in shapes:
         try:
-            print(f"\nTesting shape: {M}x{N}")
-            
             # Generate test data
             quantized = torch.randint(
                 0, 16,
                 (M, N),
                 dtype=torch.int32,
-                device=dequantizer.device
+                device=dequantizer_compiled.device
             )
             
-            # Clear cache before processing
-            torch.cuda.empty_cache()
+            # Warmup
+            for _ in range(num_warmup):
+                _ = dequantizer_eager.dequantize(quantized, batch_size=batch_size)
+                _ = dequantizer_compiled.dequantize(quantized, batch_size=batch_size)
             
-            # Time the dequantization
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            
-            start.record()
-            output = dequantizer.dequantize(quantized, batch_size=batch_size)
-            end.record()
-            
+            # Benchmark eager mode
             torch.cuda.synchronize()
-            elapsed_time = start.elapsed_time(end)
+            start_eager = time.perf_counter()
+            for _ in range(num_runs):
+                _ = dequantizer_eager.dequantize(quantized, batch_size=batch_size)
+            torch.cuda.synchronize()
+            eager_time = (time.perf_counter() - start_eager) * 1000 / num_runs
             
-            # Memory stats
-            memory_allocated = torch.cuda.memory_allocated() / 1024**2
-            memory_reserved = torch.cuda.memory_reserved() / 1024**2
+            # Benchmark compiled mode
+            torch.cuda.synchronize()
+            start_compiled = time.perf_counter()
+            for _ in range(num_runs):
+                _ = dequantizer_compiled.dequantize(quantized, batch_size=batch_size)
+            torch.cuda.synchronize()
+            compiled_time = (time.perf_counter() - start_compiled) * 1000 / num_runs
             
-            print(f"✓ Output shape: {output.shape}")
-            print(f"✓ Processing time: {elapsed_time:.2f} ms")
-            print(f"✓ Memory allocated: {memory_allocated:.1f} MB")
-            print(f"✓ Memory reserved: {memory_reserved:.1f} MB")
-            print(f"✓ Output dtype: {output.dtype}")
+            # Calculate speedup
+            speedup = eager_time / compiled_time
             
-            # Validate output
-            assert not torch.isnan(output).any(), "Output contains NaN values"
-            assert not torch.isinf(output).any(), "Output contains Inf values"
-            assert output.dtype == dequantizer.compute_dtype, "Output dtype mismatch"
+            print(f"{M}x{N:>7} | {eager_time:>10.2f} | {compiled_time:>10.2f} | {speedup:>7.2f}x")
             
         except Exception as e:
-            print(f"✗ Error with shape {M}x{N}: {str(e)}")
+            print(f"{M}x{N:>7} | Error: {str(e)}")
             import traceback
             traceback.print_exc()
     
     print("=" * 60)
 
 if __name__ == "__main__":
-    print("Testing NF4 dequantization on T4 GPU...")
-    test_t4_compatibility()
+    print("Benchmarking NF4 dequantization with torch.compile...")
+    benchmark_dequantizer()

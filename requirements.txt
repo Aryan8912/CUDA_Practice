@@ -1,4 +1,9 @@
-torch>=2.0.0
-triton>=2.0.0
-transformers>=4.30.0
-bitsandbytes>=0.41.0
+torch>=2.2.0
+triton>=2.2.0
+transformers>=4.36.0
+bitsandbytes>=0.41.3
+peft>=0.7.0
+accelerate>=0.26.0
+datasets>=2.16.0
+flash-attn>=2.5.0
+wandb>=0.16.0
